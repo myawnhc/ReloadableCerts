@@ -4,6 +4,7 @@ import com.hazelcast.config.Config;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.Job;
+import com.hazelcast.jet.config.JobConfig;
 import com.hazelcast.jet.pipeline.Pipeline;
 import com.hazelcast.jet.pipeline.ServiceFactories;
 import com.hazelcast.jet.pipeline.ServiceFactory;
@@ -11,13 +12,72 @@ import com.hazelcast.jet.pipeline.Sinks;
 import com.hazelcast.jet.pipeline.test.TestSources;
 import com.hazelcast.map.IMap;
 
+import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.KeyStore;
+import java.util.Properties;
 
 // Maybe move this to a unit test
 public class SampleJetClient {
 
+    private static KeyStore loadTrustStore() {
+        ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+        try (InputStream is = classLoader.getResourceAsStream("certs/tls-material/truststore-v1.p12")) {
+            if (is == null) {
+                throw new IllegalStateException("Unable to load trust store");
+            }
+            KeyStore trustStore = KeyStore.getInstance("PKCS12");
+            trustStore.load(is, "changeit".toCharArray());
+            // Just for visual verification of content
+            System.out.println("Truststore has " + trustStore.size() + " entries");
+            return trustStore;
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     private Pipeline buildPipeline() {
+
+        KeyStore trustStore = loadTrustStore();
+        // Kafka wants paths, not objects
+        Path trustStorePath = null;
+        try {
+            trustStorePath = Files.createTempFile("truststore", ".p12");
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        try (OutputStream os = Files.newOutputStream(trustStorePath)) {
+            trustStore.store(os, "changeit".toCharArray());
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+        Properties props = new Properties();
+        props.setProperty("boostrap.servers", "localhost:9092");
+        props.put("security-protocol", "SSL");
+        props.put("ssl.truststore.type", "PKCS12");
+        props.put("ssl.truststore.location", trustStorePath.toAbsolutePath().toString());
+        props.put("ssl.truststore.password", "changeit");
+
+        // NOTE: If we wanted to use the truststore within the pipeline, we
+        // do not want to call loadTrustStore for every item in the pipeline.
+        // Instead, use the service factory pattern:
+        ServiceFactory<?, KeyStore> keyStoreService =
+                ServiceFactories.sharedService(ctx -> loadTrustStore()
+        );
+
+        // Using in practice:
+//       Pipeline p = Pipeline.create();
+//       p.readFrom(TestSources.itemStream(100))
+//               .withoutTimestamps()
+//               .mapUsingService(keyStoreService, (truststore, item) -> {
+//                   // use the truststore
+//                   return item;
+//       });
 
         // Declare the shared service; it will reload certs as neede
         ServiceFactory<?, SchemaRegistryClientService> schemaRegistryService =
@@ -69,6 +129,10 @@ public class SampleJetClient {
         }
 
         Pipeline p = client.buildPipeline();
+        URL resourceURL = client.getClass().getClassLoader().getResource("certs/tls-material/truststore-v1.p12");
+        JobConfig jobConfig = new JobConfig();
+        assert resourceURL != null;
+        jobConfig.addClasspathResource(resourceURL);
         Job job = hz.getJet().newJob(p);
 
         // Let the job run with the initial certs for 10 seconds
